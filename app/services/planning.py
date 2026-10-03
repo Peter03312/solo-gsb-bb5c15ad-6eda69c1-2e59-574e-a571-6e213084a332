@@ -187,11 +187,16 @@ def find_itinerary(
     margin: float,
     revision: Optional[int] = None,
     blocked: Optional[dict[int, set[int]]] = None,
+    arrival_ok: Optional[set] = None,
 ) -> dict:
     """计算最早抵达行程。
 
     blocked 给出须避开的已确认占用 {seg_id: {绝对分钟}}；缺省为不避占
     （仅供不需要占用语义的内部调用）。
+    arrival_ok 给定时（绝对分钟集合），只把**落在集合内的抵达分钟**视为
+    可接受的终点到达：用于泊位规划"抵达即开工"——船到达终点节点后必须能
+    在该分钟立即开始泊位作业，否则继续在节点等待后续可行分钟；择优口径
+    不变（满足条件的最早抵达 + 同刻航段编号序列字典序）。
     未知节点 -> NODE_NOT_FOUND (404)
     窗口内缺潮位 -> MISSING_TIDE_DATA (422)
     无可行行程 -> NO_FEASIBLE_ITINERARY (404)
@@ -235,8 +240,10 @@ def find_itinerary(
     if missing:
         raise tide_missing(missing)
 
-    # 4) 起终点相同：零航段，立即抵达
+    # 4) 起终点相同：零航段，立即抵达（泊位场景下由上层用 arrival_ok 判定该分钟）
     if origin == destination:
+        if arrival_ok is not None and start_minute not in arrival_ok:
+            raise no_itinerary(origin, destination)
         return _result(
             revision, origin, destination, start_minute, window_minutes,
             draft, height, margin, arrival=start_minute, legs=[],
@@ -265,20 +272,31 @@ def find_itinerary(
 
     arrival_local = None
     for i in range(n + 1):
-        # 5.1 等待：从 i-1 原样延续到 i（同序列，不加航段编号）
+        # 5.1 等待：从 i-1 原样延续到 i（同序列，不加航段编号）。
+        #     泊位场景下（arrival_ok）"抵达即开工"——船不能先到泊位再等，
+        #     等待只能发生在上游节点，故终点状态不随等待延续；船必须于某个
+        #     可开工分钟恰好抵达（最后一腿的进入分钟在其起点节点决定）。
         if i > 0:
             for v, seq in states[i - 1].items():
+                if arrival_ok is not None and v == destination:
+                    continue
                 if v not in states[i] or seq < states[i][v]:
                     states[i][v] = seq
                     parents[i][v] = (i - 1, None)
 
-        # 5.2 终点首次出现即为最早到达；此刻其序列必为该到达时刻字典序最优
-        if destination in states[i]:
+        # 5.2 终点首次出现即为最早到达；此刻其序列必为该到达时刻字典序最优。
+        #     泊位场景（arrival_ok）下，只有"抵达即开工"可行的到达分钟才接受，
+        #     否则船在终点继续等待后续可行分钟。
+        if destination in states[i] and (
+                arrival_ok is None or start_minute + i in arrival_ok):
             arrival_local = i
             break
 
-        # 5.3 从本分钟出发的航段（船恰好在节点上即可出发，等待后亦可）
+        # 5.3 从本分钟出发的航段（船恰好在节点上即可出发，等待后亦可）。
+        #     已在终点的状态不出航（终点无后继）；泊位未就绪时只由等待延续。
         for v, seq in states[i].items():
+            if v == destination:
+                continue
             for s in out_segs.get(v, []):
                 t = travel_at[s.seg_id][i]
                 j = i + t

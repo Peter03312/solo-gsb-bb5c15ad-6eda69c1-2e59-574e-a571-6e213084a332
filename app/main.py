@@ -16,6 +16,9 @@ from .schemas import (
     BatchConfirmResponse,
     BatchPlanRequest,
     BatchPlanResponse,
+    BerthCalendarReplaceRequest,
+    BerthCreateRequest,
+    BerthOut,
     BillOut,
     BillResponse,
     ChannelGroupCreateRequest,
@@ -48,6 +51,13 @@ from .schemas import (
     VoidRecordOut,
 )
 from .services.batch import confirm_batch, plan_batch
+from .services.berths import (
+    create_berth,
+    get_berth,
+    list_berths,
+    plan_with_berth,
+    replace_calendar,
+)
 from .services.controls import load_controls, replace_segment_controls
 from .services.groups import create_group, get_group, list_groups
 from .services.planning import find_itinerary, load_occupancy
@@ -191,6 +201,55 @@ def list_segments():
             " FROM segments ORDER BY seg_id"
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---- 泊位 / 开放日历 ---------------------------------------------------------------
+
+@app.post("/api/nodes/{node_id}/berths",
+          status_code=201, response_model=BerthOut, tags=["berths"])
+def create_node_berth(node_id: str, body: BerthCreateRequest):
+    """调度员为现有节点登记泊位，可同时给出初始开放日历。
+
+    日历为一组互不交叠的半开分钟区间 [start_minute, end_minute)；
+    空列表/省略表示初始全天不开放。未知节点 404 NODE_NOT_FOUND；
+    非法区间 422 INVALID_BERTH_INTERVAL；组内交叠
+    422 OVERLAPPING_BERTH_INTERVAL，任一失败不留半成品泊位。
+    """
+    with get_conn() as conn:
+        return create_berth(
+            conn, node_id, body.name,
+            [c.model_dump() for c in body.calendar],
+        )
+
+
+@app.get("/api/berths", response_model=list[BerthOut], tags=["berths"])
+def list_all_berths():
+    """列出全部泊位（按泊位编号升序），各附当前开放日历（按起点升序）。"""
+    with get_conn() as conn:
+        return list_berths(conn)
+
+
+@app.get("/api/berths/{berth_id}", response_model=BerthOut, tags=["berths"])
+def get_one_berth(berth_id: int):
+    """读取指定泊位及其当前开放日历。未知泊位 404 BERTH_NOT_FOUND。"""
+    with get_conn() as conn:
+        return get_berth(conn, berth_id)
+
+
+@app.put("/api/berths/{berth_id}/calendar",
+         response_model=BerthOut, tags=["berths"])
+def replace_berth_calendar(berth_id: int, body: BerthCalendarReplaceRequest):
+    """以泊位编号整组替换开放日历，返回替换后的泊位与生效日历。
+
+    每个元素为半开分钟区间 [start_minute, end_minute)；空列表 calendar: []
+    表示该泊位此后全天不开放。未知泊位 404 BERTH_NOT_FOUND；非法区间
+    422 INVALID_BERTH_INTERVAL；组内交叠 422 OVERLAPPING_BERTH_INTERVAL；
+    任一失败均保留旧日历不变（已确认快照的固化作业区间也不受影响）。
+    """
+    with get_conn() as conn:
+        return replace_calendar(
+            conn, berth_id, [c.model_dump() for c in body.calendar]
+        )
 
 
 # ---- 航段分时航时管制 -------------------------------------------------------------
@@ -572,8 +631,7 @@ def plan_trip(body: PlanRequest):
             conn, body.start_minute,
             body.start_minute + body.window_minutes - 1,
         )
-        result = find_itinerary(
-            conn,
+        common = dict(
             origin=body.origin,
             destination=body.destination,
             start_minute=body.start_minute,
@@ -584,6 +642,15 @@ def plan_trip(body: PlanRequest):
             revision=body.revision,
             blocked=blocked,
         )
+        if body.berth_id is not None:
+            # 指定终点泊位：抵达即开工，作业区间须完整落在同一开放区间且
+            # 不与有效确认行程的泊位占用重叠；无满足条件的抵达明确报无解
+            result = plan_with_berth(
+                conn, berth_id=body.berth_id, job_minutes=body.job_minutes,
+                **common,
+            )
+        else:
+            result = find_itinerary(conn, **common)
         result["ship_no"] = params["ship_no"]
         result["ship_version"] = params["ship_version"]
     return result
@@ -627,37 +694,47 @@ def confirm_trip(body: ConfirmRequest):
                      "current_revision": latest["revision"] if latest else None},
                 )
 
-            # 2) 同一事务内依据该修订与**当时占用**重新计算
+            # 2) 同一事务内依据该修订、**当时开放日历**与**当时占用**重新计算
             #    （既有已确认快照即使彼此重叠也一并作为占用；本行程尚未落库）
             blocked = load_occupancy(
                 conn, body.start_minute, body.start_minute + body.window_minutes - 1
             )
+            common = dict(
+                origin=body.origin,
+                destination=body.destination,
+                start_minute=body.start_minute,
+                window_minutes=body.window_minutes,
+                draft=params["draft"],
+                height=params["height"],
+                margin=params["margin"],
+                revision=body.revision,
+                blocked=blocked,
+            )
             try:
-                recalculated = find_itinerary(
-                    conn,
-                    origin=body.origin,
-                    destination=body.destination,
-                    start_minute=body.start_minute,
-                    window_minutes=body.window_minutes,
-                    draft=params["draft"],
-                    height=params["height"],
-                    margin=params["margin"],
-                    revision=body.revision,
-                    blocked=blocked,
-                )
+                if body.berth_id is not None:
+                    # 泊位行程：按当时日历与有效泊位占用复算"抵达即开工"
+                    recalculated = plan_with_berth(
+                        conn, berth_id=body.berth_id,
+                        job_minutes=body.job_minutes, **common,
+                    )
+                else:
+                    recalculated = find_itinerary(conn, **common)
             except ApiError as exc:
-                # 占用变化导致窗口内已无可行行程：提交行程不再符合最优结果
-                if exc.code == "NO_FEASIBLE_ITINERARY":
+                # 占用/日历变化导致窗口内已无可行行程：提交行程不再符合最优结果
+                if exc.code in ("NO_FEASIBLE_ITINERARY",
+                                "NO_FEASIBLE_BERTH_ITINERARY"):
                     raise ApiError(
                         409,
                         "PLAN_MISMATCH",
-                        "占用已变化：窗口内已不存在可行行程，提交行程不再符合"
+                        "占用或泊位日历已变化：窗口内已不存在可行行程"
+                        "（或无抵达即开工的泊位作业区间），提交行程不再符合"
                         "最优结果，确认失败",
                         {"reason": "no_feasible_itinerary"},
                     )
                 raise
 
-            # 3) 回填行程必须与复核结果逐段一致
+            # 3) 回填行程必须与复核结果逐段一致；泊位行程的作业分钟与作业
+            #    区间（= 抵达）也须一致，否则日历/占用变化即拒绝、不保存
             def norm(legs):
                 return [
                     (l["seg_id"], l["origin"], l["destination"],
@@ -669,27 +746,39 @@ def confirm_trip(body: ConfirmRequest):
 
             submitted = norm(body.itinerary)
             canonical = norm(recalculated["itinerary"])
-            if submitted != canonical or recalculated["arrival_minute"] != _payload_arrival(body):
+            berth_mismatch = (
+                body.berth_id is not None and (
+                    body.job_minutes != recalculated["job_minutes"]
+                    or _payload_arrival(body) != recalculated["job_start_minute"]
+                )
+            )
+            if submitted != canonical or \
+                    recalculated["arrival_minute"] != _payload_arrival(body) or \
+                    berth_mismatch:
                 raise ApiError(
                     409,
                     "PLAN_MISMATCH",
-                    "行程复核结果与所提交行程不一致（窗口/船舶参数/潮位数据可能已变化），确认失败",
+                    "行程或泊位作业区间复核结果与所提交内容不一致"
+                    "（窗口/船舶参数/潮位数据/占用/泊位日历可能已变化），确认失败",
                     {"recalculated": recalculated},
                 )
 
             # 4) 复核通过：按"当时结果"保存不可变快照
-            #    （固化所用参数与档案引用，后续档案变更不改写历史）
+            #    （固化所用参数、档案引用与泊位作业区间，后续变更不改写历史）
             cur = conn.execute(
                 "INSERT INTO confirmed_trips"
                 " (revision, origin, destination, start_minute, window_minutes,"
                 "  draft, height, margin, arrival_minute, itinerary,"
-                "  ship_no, ship_version)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "  ship_no, ship_version, berth_id, berth_job_start, berth_job_end)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (body.revision, body.origin, body.destination, body.start_minute,
                  body.window_minutes, params["draft"], params["height"],
                  params["margin"],
                  recalculated["arrival_minute"], json.dumps(recalculated["itinerary"]),
-                 params["ship_no"], params["ship_version"]),
+                 params["ship_no"], params["ship_version"],
+                 recalculated.get("berth_id"),
+                 recalculated.get("job_start_minute"),
+                 recalculated.get("job_end_minute")),
             )
             trip_id = cur.lastrowid
             row = conn.execute(
@@ -915,6 +1004,10 @@ def _trip_out(d: dict) -> TripOut:
         # 确认时固化的档案引用（无档案引用为 null）；后续档案变更不改写快照
         ship_no=d.get("ship_no"),
         ship_version=d.get("ship_version"),
+        # 泊位作业快照（非泊位行程为 null）；日历变更不改写历史
+        berth_id=d.get("berth_id"),
+        berth_job_start=d.get("berth_job_start"),
+        berth_job_end=d.get("berth_job_end"),
         arrival_minute=d["arrival_minute"],
         itinerary=json.loads(d["itinerary"]),
         confirmed_at=d["confirmed_at"],

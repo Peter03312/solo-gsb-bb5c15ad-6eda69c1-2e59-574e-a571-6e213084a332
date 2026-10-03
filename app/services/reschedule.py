@@ -34,6 +34,7 @@ from typing import Optional
 
 from .. import config
 from ..errors import ApiError, tide_missing, trip_not_found
+from .berths import feasible_job_starts, load_berth_occupancy, load_calendar
 from .controls import effective_travel_time, load_controls
 from .planning import (
     Segment,
@@ -130,9 +131,25 @@ def review_and_reschedule(
     blocked = load_occupancy(conn, start, horizon - 1,
                              exclude_trip_id=snap["trip_id"])
     controls = load_controls(conn, [leg["seg_id"] for leg in legs])
+
+    # 泊位行程：改期建议还须在原泊位按**当时开放日历**与**当时有效泊位占用**
+    # （排除自身固化作业区间）找到"抵达即开工"的即时作业区间；只建议不预留。
+    berth_arrival_ok = None
+    berth_job_minutes = None
+    if snap["berth_id"] is not None:
+        berth_job_minutes = snap["berth_job_end"] - snap["berth_job_start"]
+        berth_arrival_ok = feasible_job_starts(
+            load_calendar(conn, snap["berth_id"]),
+            load_berth_occupancy(conn, snap["berth_id"],
+                                 exclude_trip_id=snap["trip_id"]),
+            berth_job_minutes,
+            lo=start, hi=horizon,
+        )
+
     resched = _reschedule(
         legs, segs, tide, start, window, draft, height, margin, revision,
-        blocked, controls,
+        blocked, controls, arrival_ok=berth_arrival_ok,
+        berth_id=snap["berth_id"], job_minutes=berth_job_minutes,
     )
     if resched is None:
         result["no_solution"] = True
@@ -206,13 +223,14 @@ def _check_original(legs, segs, tide, draft, height, margin) -> Optional[dict]:
 
 def _reschedule(
     legs, segs, tide, start, window, draft, height, margin, revision,
-    blocked=None, controls=None,
+    blocked=None, controls=None, arrival_ok=None, berth_id=None, job_minutes=None,
 ) -> Optional[dict]:
     """固定航段序列的时间展开 DP，返回最优改期或 None。
 
     blocked 为须避开的其他已确认快照占用 {seg_id: {绝对分钟}}（本快照
     自身已排除）；controls 为当前分时航时管制，各段航时以**出发分钟**
-    当时管制计（未命中区间用航段基础航时）。
+    当时管制计（未命中区间用航段基础航时）。arrival_ok 给定时（泊位行程），
+    只接受落在集合内的最终抵达分钟（抵达即开工），且终点不参与节点等待。
     """
     k = len(legs)
     if k == 0:
@@ -240,7 +258,8 @@ def _reschedule(
         cur = states[i]
         nxt = states[i + 1]
 
-        # 按分钟递增维护「抵达分钟 <= 当前出发分钟」的最优前缀
+        # 按分钟递增维护「抵达分钟 <= 当前出发分钟」的最优前缀（允许零等待
+        # 衔接：前段于 d 抵达，后段可于同一分钟 d 出发，与前向规划语义一致）
         best_key = None  # (changes, departures)
         for d in range(0, n + 1):
             if d in cur:
@@ -263,10 +282,19 @@ def _reschedule(
     if not states[k]:
         return None
 
-    # 全局择优：变化段数最少 -> 抵达最早 -> 出发分钟序列字典序最小
+    # 全局择优：变化段数最少 -> 抵达最早 -> 出发分钟序列字典序最小。
+    # 泊位行程（arrival_ok）只接受"抵达即开工"可行的最终抵达分钟。
+    candidates = states[k].items()
+    if arrival_ok is not None:
+        candidates = (
+            (al, key) for al, key in candidates if start + al in arrival_ok
+        )
     arrival_local, key = min(
-        states[k].items(), key=lambda kv: (kv[1][0], kv[0], kv[1][1])
+        candidates, key=lambda kv: (kv[1][0], kv[0], kv[1][1]),
+        default=(None, None),
     )
+    if arrival_local is None:
+        return None
     changes, deps = key
     arrival = start + arrival_local
 
@@ -298,5 +326,8 @@ def _reschedule(
         "total_wait_minutes": arrival - start - sailing,
         "changed_leg_count": changes,
         "changed_legs": changed,
+        "berth_id": berth_id,
+        "job_start_minute": arrival if berth_id is not None else None,
+        "job_end_minute": arrival + job_minutes if berth_id is not None else None,
         "itinerary": itinerary,
     }

@@ -43,6 +43,30 @@ def no_itinerary(origin: str, destination: str) -> ApiError:
     )
 
 
+def unknown_berth(berth_id: int) -> ApiError:
+    return ApiError(404, "BERTH_NOT_FOUND", f"未知泊位: {berth_id}",
+                    {"berth_id": berth_id})
+
+
+def berth_not_at_destination(berth_id: int, berth_node: str, destination: str) -> ApiError:
+    return ApiError(
+        422,
+        "BERTH_NOT_AT_DESTINATION",
+        f"泊位 {berth_id} 属于节点 {berth_node}，不是终点 {destination} 的泊位",
+        {"berth_id": berth_id, "berth_node": berth_node, "destination": destination},
+    )
+
+
+def no_berth_itinerary(berth_id: int, job_minutes: int) -> ApiError:
+    return ApiError(
+        404,
+        "NO_FEASIBLE_BERTH_ITINERARY",
+        f"窗口内不存在抵达泊位 {berth_id} 后可立即开始 {job_minutes} 分钟作业的行程"
+        "（抵达即开工：作业区间须完整落在同一开放区间且不与有效泊位占用重叠）",
+        {"berth_id": berth_id, "job_minutes": job_minutes},
+    )
+
+
 def ship_not_found(ship_no: str) -> ApiError:
     return ApiError(404, "SHIP_NOT_FOUND", f"未知船号: {ship_no}",
                     {"ship_no": ship_no})

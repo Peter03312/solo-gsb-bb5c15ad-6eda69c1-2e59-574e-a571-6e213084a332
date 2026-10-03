@@ -37,6 +37,43 @@ class SegmentOut(BaseModel):
     clearance: Optional[float] = None
 
 
+# ---- 泊位与开放日历 ----------------------------------------------------------------
+
+class BerthIntervalIn(BaseModel):
+    # 合法性（start>=0、end>start）由服务层统一校验并返回 INVALID_BERTH_INTERVAL，
+    # 保证非法区间只有一个拒绝口径
+    start_minute: int = Field(description="开放半开区间起点（含），绝对分钟，>=0")
+    end_minute: int = Field(description="开放半开区间止点（不含），必须 > start_minute")
+
+
+class BerthCreateRequest(BaseModel):
+    name: Optional[str] = None
+    calendar: list[BerthIntervalIn] = Field(
+        default_factory=list,
+        description="初始开放日历（半开、互不交叠）；空列表/省略表示初始全天不开放",
+    )
+
+
+class BerthCalendarReplaceRequest(BaseModel):
+    calendar: list[BerthIntervalIn] = Field(
+        description="整组替换的半开分钟开放区间清单（互不交叠）；空列表表示全天不开放"
+    )
+
+
+class BerthIntervalOut(BerthIntervalIn):
+    pass
+
+
+class BerthOut(BaseModel):
+    berth_id: int = Field(description="泊位编号（自增、不可变）")
+    node_id: str = Field(description="泊位所属节点（泊位必须属于规划终点节点）")
+    name: Optional[str] = None
+    created_at: str
+    calendar: list[BerthIntervalOut] = Field(
+        description="当前生效的开放日历（按起点升序，半开互不交叠）；空列表表示全天不开放"
+    )
+
+
 # ---- 航段分时航时管制 -------------------------------------------------------------
 
 class TravelControlIn(BaseModel):
@@ -193,6 +230,14 @@ def _check_ship_version_coupling(ship_no, ship_version):
         raise ValueError("按船号确认时必须回填规划所得档案版本 ship_version")
 
 
+def _check_berth_coupling(berth_id, job_minutes):
+    """终点泊位与正整数作业分钟必须成对出现（指定泊位即抵达即开工）。"""
+    if berth_id is None and job_minutes is not None:
+        raise ValueError("未指定 berth_id 时不得单独提供 job_minutes")
+    if berth_id is not None and job_minutes is None:
+        raise ValueError("指定终点泊位 berth_id 时必须同时给出正整数 job_minutes")
+
+
 class PlanRequest(BaseModel):
     origin: str
     destination: str
@@ -211,11 +256,21 @@ class PlanRequest(BaseModel):
         default=None, min_length=1,
         description="船舶档案船号：代替三项参数，按当前启用版本规划",
     )
+    berth_id: Optional[int] = Field(
+        default=None,
+        description="终点泊位编号：与 job_minutes 成对出现；抵达即开工，"
+                    "作业区间须完整落在泊位同一开放区间且不与有效泊位占用重叠",
+    )
+    job_minutes: Optional[int] = Field(
+        default=None, gt=0,
+        description="泊位作业分钟（正整数）：与 berth_id 成对出现",
+    )
     revision: Optional[int] = Field(default=None, description="潮位修订号；不填用最新")
 
     @model_validator(mode="after")
     def _ship_xor_params(self):
         _check_ship_xor_params(self.ship_no, self.draft, self.height, self.margin)
+        _check_berth_coupling(self.berth_id, self.job_minutes)
         return self
 
 
@@ -242,6 +297,21 @@ class PlanResponse(BaseModel):
     )
     ship_version: Optional[int] = Field(
         default=None, description="按档案规划时回传的档案版本；直接提交参数时为 null"
+    )
+    berth_id: Optional[int] = Field(
+        default=None,
+        description="指定终点泊位时回传泊位编号；未指定泊位为 null",
+    )
+    job_minutes: Optional[int] = Field(
+        default=None, description="指定泊位时回传的作业分钟；未指定泊位为 null"
+    )
+    job_start_minute: Optional[int] = Field(
+        default=None,
+        description="指定泊位时的作业起点分钟（= arrival_minute，抵达即开工）；否则 null",
+    )
+    job_end_minute: Optional[int] = Field(
+        default=None,
+        description="指定泊位时的作业止点分钟（不含）= job_start_minute + job_minutes；否则 null",
     )
     arrival_minute: int
     total_wait_minutes: int
@@ -279,10 +349,18 @@ class BatchShipIn(BaseModel):
         default=None, min_length=1,
         description="船舶档案船号：代替三项参数，按当前启用版本规划",
     )
+    berth_id: Optional[int] = Field(
+        default=None,
+        description="终点泊位编号：与 job_minutes 成对出现；后船还须避开本批前船的拟泊位占用",
+    )
+    job_minutes: Optional[int] = Field(
+        default=None, gt=0, description="泊位作业分钟（正整数）：与 berth_id 成对出现"
+    )
 
     @model_validator(mode="after")
     def _ship_xor_params(self):
         _check_ship_xor_params(self.ship_no, self.draft, self.height, self.margin)
+        _check_berth_coupling(self.berth_id, self.job_minutes)
         return self
 
 
@@ -340,6 +418,15 @@ class BatchTripOut(BaseModel):
     ship_version: Optional[int] = Field(
         default=None, description="按档案确认时固化的档案版本；直接提交参数时为 null"
     )
+    berth_id: Optional[int] = Field(
+        default=None, description="泊位行程固化的泊位编号；非泊位行程为 null"
+    )
+    job_start_minute: Optional[int] = Field(
+        default=None, description="泊位行程固化的作业起点（= 抵达分钟）；非泊位行程为 null"
+    )
+    job_end_minute: Optional[int] = Field(
+        default=None, description="泊位行程固化的作业止点（不含）；非泊位行程为 null"
+    )
     arrival_minute: int
     itinerary: list[LegOut]
 
@@ -370,6 +457,18 @@ class TripOut(BaseModel):
     )
     ship_version: Optional[int] = Field(
         default=None, description="确认时固化的档案版本；无档案引用为 null"
+    )
+    berth_id: Optional[int] = Field(
+        default=None,
+        description="泊位作业快照：确认时固化的终点泊位编号；非泊位行程为 null。"
+                    "日历后续变更不改写该快照",
+    )
+    berth_job_start: Optional[int] = Field(
+        default=None,
+        description="确认时固化的作业起点分钟（= 抵达分钟，抵达即开工）；非泊位行程为 null",
+    )
+    berth_job_end: Optional[int] = Field(
+        default=None, description="确认时固化的作业止点分钟（不含）；非泊位行程为 null"
     )
     arrival_minute: int
     itinerary: list[LegOut]
@@ -449,6 +548,16 @@ class RescheduleOut(BaseModel):
     total_wait_minutes: int
     changed_leg_count: int = Field(description="相对快照出发分钟发生变化的航段个数")
     changed_legs: list[ChangedLegOut]
+    berth_id: Optional[int] = Field(
+        default=None,
+        description="原快照为泊位行程时：改期建议同时给出的原泊位编号（按当时日历求解）；否则 null",
+    )
+    job_start_minute: Optional[int] = Field(
+        default=None, description="泊位行程改期建议的即时作业起点（= 改期抵达分钟，只建议不预留）；否则 null"
+    )
+    job_end_minute: Optional[int] = Field(
+        default=None, description="泊位行程改期建议的作业止点（不含）；否则 null"
+    )
     itinerary: list[LegOut]
 
 

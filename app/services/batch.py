@@ -18,6 +18,7 @@ import sqlite3
 from typing import Iterable, Optional
 
 from ..errors import ApiError
+from .berths import plan_with_berth
 from .groups import expand_group_occupancy, load_groups
 from .planning import find_itinerary, load_occupancy
 from .ships import resolve_for_confirm, resolve_for_plan
@@ -84,6 +85,40 @@ def _add_itinerary_occupancy(blocked: dict[int, set[int]], legs: Iterable[dict],
         expand_group_occupancy(blocked, seg_to_group, group_members)
 
 
+def _add_berth_occupancy(berth_blocked: dict[int, list[tuple[int, int]]],
+                         berth_id: int, job_start: int, job_end: int) -> None:
+    """把本批前船的泊位拟占用（半开 [start, end)）并入按泊位分组的清单。
+
+    后船规划时以 extra_forbidden 传入；同泊位首尾相接合法（半开口径）。
+    """
+    berth_blocked.setdefault(berth_id, []).append((job_start, job_end))
+
+
+def _plan_one_ship(conn, ship, params: dict, *, revision: int,
+                   blocked: dict[int, set[int]], groups,
+                   berth_blocked: dict[int, list[tuple[int, int]]]) -> dict:
+    """按单船输入调用规划；指定泊位时走泊位感知规划并回传作业区间。
+
+    规划成功后把该船的航段（含组展开）与泊位拟占用并入 blocked，供本批后船避让。
+    """
+    common = _ship_kwargs(ship, params)
+    if ship.berth_id is not None:
+        result = plan_with_berth(
+            conn, **common, revision=revision, blocked=blocked,
+            berth_id=ship.berth_id, job_minutes=ship.job_minutes,
+            extra_berth_occupancy=berth_blocked.get(ship.berth_id),
+        )
+    else:
+        result = find_itinerary(conn, **common, revision=revision, blocked=blocked)
+    _add_itinerary_occupancy(blocked, result["itinerary"], groups)
+    if ship.berth_id is not None:
+        _add_berth_occupancy(
+            berth_blocked, ship.berth_id,
+            result["job_start_minute"], result["job_end_minute"],
+        )
+    return result
+
+
 def _norm_legs(legs) -> list[tuple]:
     """逐段比对用的规范化元组序列（与单船确认口径一致）。"""
     out = []
@@ -140,17 +175,19 @@ def plan_batch(conn, ships: list, revision: Optional[int]) -> dict:
     hi = max(s.start_minute + s.window_minutes - 1 for s in ships)
     blocked = load_occupancy(conn, lo, hi)
     groups = load_groups(conn)
+    # 本批前船的泊位拟占用：{berth_id: [(半开 [job_start, job_end)), ...]}
+    berth_blocked: dict[int, list[tuple[int, int]]] = {}
 
     results = []
     for i, ship in enumerate(ships):
         try:
             params = _resolve_plan_params(conn, ship)
-            result = find_itinerary(
-                conn, **_ship_kwargs(ship, params), revision=rev, blocked=blocked,
+            result = _plan_one_ship(
+                conn, ship, params, revision=rev, blocked=blocked,
+                groups=groups, berth_blocked=berth_blocked,
             )
         except ApiError as exc:
             raise _tag_ship_error(i, exc)
-        _add_itinerary_occupancy(blocked, result["itinerary"], groups)
         # 按档案预排的船回传船号、版本及所用参数（直接提交参数则为 null）
         result["ship_no"] = params["ship_no"]
         result["ship_version"] = params["ship_version"]
@@ -273,49 +310,70 @@ def confirm_batch(conn, body) -> tuple[dict, bool]:
         hi = max(s.start_minute + s.window_minutes - 1 for s in body.ships)
         blocked = load_occupancy(conn, lo, hi)
         groups = load_groups(conn)
+        # 批内前船复算的泊位拟占用：{berth_id: [(半开 [job_start, job_end)), ...]}
+        berth_blocked: dict[int, list[tuple[int, int]]] = {}
 
         trip_refs: list[dict] = []
         for i, ship in enumerate(body.ships):
             params = ship_params[i]
+            common = _ship_kwargs(ship, params)
             try:
-                recalculated = find_itinerary(
-                    conn, **_ship_kwargs(ship, params),
-                    revision=body.revision, blocked=blocked,
-                )
+                if ship.berth_id is not None:
+                    recalculated = plan_with_berth(
+                        conn, **common, revision=body.revision, blocked=blocked,
+                        berth_id=ship.berth_id, job_minutes=ship.job_minutes,
+                        extra_berth_occupancy=berth_blocked.get(ship.berth_id),
+                    )
+                else:
+                    recalculated = find_itinerary(
+                        conn, **common, revision=body.revision, blocked=blocked,
+                    )
             except ApiError as exc:
-                if exc.code == "NO_FEASIBLE_ITINERARY":
+                if exc.code in ("NO_FEASIBLE_ITINERARY", "NO_FEASIBLE_BERTH_ITINERARY"):
                     raise _plan_mismatch(
                         i, reason="no_feasible_itinerary",
-                        message="占用或潮位已变化：该船窗口内已不存在可行行程，"
+                        message="占用、潮位或泊位日历已变化：该船窗口内已不存在"
+                                "可行行程（或无抵达即开工的泊位作业区间），"
                                 "整批确认失败，全批不保存",
                     )
                 raise _tag_ship_error(i, exc)
 
             submitted = _norm_legs(ship.itinerary)
             canonical = _norm_legs(recalculated["itinerary"])
+            berth_changed = (
+                ship.berth_id is not None and (
+                    ship.job_minutes != recalculated["job_minutes"]
+                    or _arrival_of(ship, ship.itinerary)
+                    != recalculated["job_start_minute"]
+                )
+            )
             if submitted != canonical or _arrival_of(ship, ship.itinerary) != \
-                    recalculated["arrival_minute"]:
+                    recalculated["arrival_minute"] or berth_changed:
                 raise _plan_mismatch(
                     i, reason="itinerary_mismatch",
-                    message="该船行程复核结果与所提交行程不一致（窗口/船舶参数/"
-                            "潮位/占用可能已变化），整批确认失败，全批不保存",
+                    message="该船行程或泊位作业区间复核结果与所提交内容不一致"
+                            "（窗口/船舶参数/潮位/占用/泊位日历可能已变化），"
+                            "整批确认失败，全批不保存",
                     recalculated=recalculated,
                 )
 
             # 4a) 先保存该船不可变快照（同一事务，失败整体回滚）；
-            #     快照固化所用参数与档案引用（船号 + 版本，无档案则为 NULL）
+            #     快照固化所用参数、档案引用与泊位作业区间（非泊位行程为 NULL）
             cur = conn.execute(
                 "INSERT INTO confirmed_trips"
                 " (revision, origin, destination, start_minute, window_minutes,"
                 "  draft, height, margin, arrival_minute, itinerary,"
-                "  ship_no, ship_version)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "  ship_no, ship_version, berth_id, berth_job_start, berth_job_end)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (body.revision, ship.origin, ship.destination, ship.start_minute,
                  ship.window_minutes, params["draft"], params["height"],
                  params["margin"],
                  recalculated["arrival_minute"],
                  json.dumps(recalculated["itinerary"]),
-                 params["ship_no"], params["ship_version"]),
+                 params["ship_no"], params["ship_version"],
+                 recalculated.get("berth_id"),
+                 recalculated.get("job_start_minute"),
+                 recalculated.get("job_end_minute")),
             )
             trip_refs.append({
                 "index": i,
@@ -323,11 +381,20 @@ def confirm_batch(conn, body) -> tuple[dict, bool]:
                 "revision": body.revision,
                 "ship_no": params["ship_no"],
                 "ship_version": params["ship_version"],
+                "berth_id": recalculated.get("berth_id"),
+                "job_start_minute": recalculated.get("job_start_minute"),
+                "job_end_minute": recalculated.get("job_end_minute"),
                 "arrival_minute": recalculated["arrival_minute"],
                 "itinerary": recalculated["itinerary"],
             })
             # 前船复算行程作为后船的当时占用（按当前组关系展开到整组）
             _add_itinerary_occupancy(blocked, recalculated["itinerary"], groups)
+            if ship.berth_id is not None:
+                _add_berth_occupancy(
+                    berth_blocked, ship.berth_id,
+                    recalculated["job_start_minute"],
+                    recalculated["job_end_minute"],
+                )
 
         result = {
             "idempotency_key": key,

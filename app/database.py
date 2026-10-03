@@ -59,6 +59,25 @@ CREATE TABLE IF NOT EXISTS ship_versions (
     PRIMARY KEY (ship_no, version)
 );
 
+-- 泊位：调度员为现有节点登记的靠泊作业点。泊位挂在唯一节点下；其开放日历
+-- 是一组互不交叠的半开分钟区间 [start_minute, end_minute)，以泊位为单位
+-- 整组替换（PUT 接口，先全删后插，失败回滚、旧日历保留）。空日历表示该泊位
+-- 全天不开放。指定泊位的规划：船抵达即开工，作业区间 [arrival, arrival+job)
+-- 必须完整落在同一开放区间内，且不与其他有效确认行程的泊位作业区间重叠。
+CREATE TABLE IF NOT EXISTS berths (
+    berth_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id     TEXT NOT NULL REFERENCES nodes(node_id),  -- 泊位所属终点节点
+    name        TEXT,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS berth_calendar (
+    berth_id     INTEGER NOT NULL REFERENCES berths(berth_id),
+    start_minute INTEGER NOT NULL CHECK (start_minute >= 0),
+    end_minute   INTEGER NOT NULL CHECK (end_minute > start_minute),  -- 半开区间止（不含）
+    PRIMARY KEY (berth_id, start_minute)
+);
+
 CREATE TABLE IF NOT EXISTS confirmed_trips (
     trip_id         INTEGER PRIMARY KEY AUTOINCREMENT,
     revision        INTEGER NOT NULL,                       -- 确认时所据修订号（快照）
@@ -73,6 +92,13 @@ CREATE TABLE IF NOT EXISTS confirmed_trips (
     itinerary       TEXT NOT NULL,                          -- JSON 快照
     ship_no         TEXT,                                   -- 档案引用（可空）：确认时所用船号
     ship_version    INTEGER,                                -- 档案引用（可空）：确认时所用档案版本
+    -- 泊位作业快照（可空三列，同时为空表示非泊位行程）：确认时按当时开放日历
+    -- 与泊位占用复算通过后固化 [job_start, job_end)；之后日历如何变更都不改写
+    -- 历史。泊位占用读取只统计未作废行程的这两列；作废即释放。
+    -- （三列对旧库由 _migrate 以 ALTER TABLE 平滑补齐，配套索引也在迁移后建立）
+    berth_id          INTEGER,                              -- 作业泊位（属于 destination）
+    berth_job_start   INTEGER,                              -- 作业起点（= 抵达分钟，抵达即开工）
+    berth_job_end     INTEGER,                              -- 作业止点（不含）= job_start + job_minutes
     confirmed_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -201,7 +227,9 @@ def init_db(conn: sqlite3.Connection) -> None:
 def _migrate(conn: sqlite3.Connection) -> None:
     """旧版数据库平滑升级：为 tide_values 补 error 列（既有行误差取 0）；
     为 confirmed_trips 补 ship_no / ship_version 档案引用列（既有行程为 NULL，
-    表示直接提交参数确认、无档案引用）。"""
+    表示直接提交参数确认、无档案引用）；为 confirmed_trips 补泊位作业快照
+    berth_id / berth_job_start / berth_job_end 三列（既有行程为 NULL，
+    表示非泊位行程，历史快照不被改写）。"""
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(tide_values)").fetchall()}
     if "error" not in cols:
         conn.execute("ALTER TABLE tide_values ADD COLUMN error REAL NOT NULL DEFAULT 0.0")
@@ -210,6 +238,21 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE confirmed_trips ADD COLUMN ship_no TEXT")
     if "ship_version" not in trip_cols:
         conn.execute("ALTER TABLE confirmed_trips ADD COLUMN ship_version INTEGER")
+    for col, ddl in (
+        ("berth_id", "INTEGER"),
+        ("berth_job_start", "INTEGER"),
+        ("berth_job_end", "INTEGER"),
+    ):
+        if col not in trip_cols:
+            conn.execute(f"ALTER TABLE confirmed_trips ADD COLUMN {col} {ddl}")
+    if not any(
+        r["name"] == "idx_confirmed_trips_berth"
+        for r in conn.execute("PRAGMA index_list(confirmed_trips)").fetchall()
+    ):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_confirmed_trips_berth"
+            " ON confirmed_trips(berth_id)"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +306,17 @@ def _seed_demo(conn: sqlite3.Connection) -> None:
             "INSERT INTO toll_rates(version, seg_id, start_minute, end_minute,"
             " rate_cents_per_minute) VALUES (1, 1, ?, ?, ?)",
             [(0, 360, 2), (360, 720, 1), (720, 1440, 2)],
+        )
+
+        # 内港 D 节点的演示泊位：全天开放 [0,1440)。调度员随后可通过
+        # PUT /api/berths/{id}/calendar 整组替换开放日历（失败不改旧日历）。
+        berth_id = conn.execute(
+            "INSERT INTO berths(node_id, name) VALUES ('D', '内港1号泊位')"
+        ).lastrowid
+        conn.execute(
+            "INSERT INTO berth_calendar(berth_id, start_minute, end_minute)"
+            " VALUES (?, 0, 1440)",
+            (berth_id,),
         )
         conn.execute("COMMIT")
     except Exception:
