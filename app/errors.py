@@ -46,3 +46,24 @@ def no_itinerary(origin: str, destination: str) -> ApiError:
 def ship_not_found(ship_no: str) -> ApiError:
     return ApiError(404, "SHIP_NOT_FOUND", f"未知船号: {ship_no}",
                     {"ship_no": ship_no})
+
+
+def berth_not_found(berth_id: str) -> ApiError:
+    return ApiError(404, "BERTH_NOT_FOUND", f"未知泊位: {berth_id}",
+                    {"berth_id": berth_id})
+
+
+def berth_exists(berth_id: str) -> ApiError:
+    return ApiError(409, "BERTH_EXISTS", f"泊位已存在: {berth_id}",
+                    {"berth_id": berth_id})
+
+
+def berth_not_at_destination(berth_id: str, berth_node: str,
+                             destination: str) -> ApiError:
+    return ApiError(
+        422,
+        "BERTH_NOT_AT_DESTINATION",
+        f"泊位 {berth_id} 属于节点 {berth_node}，不属于终点 {destination}，拒绝预排",
+        {"berth_id": berth_id, "berth_node": berth_node,
+         "destination": destination},
+    )

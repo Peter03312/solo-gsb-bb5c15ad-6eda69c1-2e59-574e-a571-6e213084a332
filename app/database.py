@@ -59,6 +59,28 @@ CREATE TABLE IF NOT EXISTS ship_versions (
     PRIMARY KEY (ship_no, version)
 );
 
+-- 泊位：调度员为**现有节点**登记的靠泊资源。泊位编号全局唯一；每个泊位
+-- 维护一组半开分钟开放日历区间 [start_minute, end_minute)（整组替换、
+-- 互不交叠），船抵达后作业区间 [arrival, arrival+work) 必须完整落在某一
+-- 开放区间内。泊位属性（所属节点）建成即固定；日历可随时整组替换，
+-- 替换不影响已确认快照固化的泊位作业区间（见 confirmed_trips）。
+CREATE TABLE IF NOT EXISTS berths (
+    berth_id    TEXT PRIMARY KEY,                           -- 全局唯一泊位编号
+    node_id     TEXT NOT NULL REFERENCES nodes(node_id),    -- 所属节点（建成固定）
+    note        TEXT,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 泊位开放日历：半开分钟区间 [start_minute, end_minute)。同一泊位的区间
+-- 互不半开交叠（首尾相接合法），服务层保证；整组替换（同 berth_id 先全删
+-- 再插），任何校验失败回滚、旧日历原样保留。
+CREATE TABLE IF NOT EXISTS berth_open_intervals (
+    berth_id     TEXT NOT NULL REFERENCES berths(berth_id),
+    start_minute INTEGER NOT NULL CHECK (start_minute >= 0),
+    end_minute   INTEGER NOT NULL CHECK (end_minute > start_minute),  -- 半开止（不含）
+    PRIMARY KEY (berth_id, start_minute)
+);
+
 CREATE TABLE IF NOT EXISTS confirmed_trips (
     trip_id         INTEGER PRIMARY KEY AUTOINCREMENT,
     revision        INTEGER NOT NULL,                       -- 确认时所据修订号（快照）
@@ -73,6 +95,10 @@ CREATE TABLE IF NOT EXISTS confirmed_trips (
     itinerary       TEXT NOT NULL,                          -- JSON 快照
     ship_no         TEXT,                                   -- 档案引用（可空）：确认时所用船号
     ship_version    INTEGER,                                -- 档案引用（可空）：确认时所用档案版本
+    berth_id        TEXT,                                   -- 泊位引用（可空）：指定泊位预排时确认的终点泊位
+    work_minutes    INTEGER,                                -- 作业分钟（可空）：正整数；与 berth_id 成对
+    work_start_minute INTEGER,                              -- 作业区间起点（可空）：抵达即开工时等于 arrival_minute
+    work_end_minute   INTEGER,                              -- 作业区间止点（可空，不含）：work_start + work
     confirmed_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -201,7 +227,9 @@ def init_db(conn: sqlite3.Connection) -> None:
 def _migrate(conn: sqlite3.Connection) -> None:
     """旧版数据库平滑升级：为 tide_values 补 error 列（既有行误差取 0）；
     为 confirmed_trips 补 ship_no / ship_version 档案引用列（既有行程为 NULL，
-    表示直接提交参数确认、无档案引用）。"""
+    表示直接提交参数确认、无档案引用）与 berth_id / work_minutes /
+    work_start_minute / work_end_minute 泊位作业快照列（既有行程为 NULL，
+    表示未指定泊位的旧确认，其请求与响应保持原样）。"""
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(tide_values)").fetchall()}
     if "error" not in cols:
         conn.execute("ALTER TABLE tide_values ADD COLUMN error REAL NOT NULL DEFAULT 0.0")
@@ -210,6 +238,14 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE confirmed_trips ADD COLUMN ship_no TEXT")
     if "ship_version" not in trip_cols:
         conn.execute("ALTER TABLE confirmed_trips ADD COLUMN ship_version INTEGER")
+    if "berth_id" not in trip_cols:
+        conn.execute("ALTER TABLE confirmed_trips ADD COLUMN berth_id TEXT")
+    if "work_minutes" not in trip_cols:
+        conn.execute("ALTER TABLE confirmed_trips ADD COLUMN work_minutes INTEGER")
+    if "work_start_minute" not in trip_cols:
+        conn.execute("ALTER TABLE confirmed_trips ADD COLUMN work_start_minute INTEGER")
+    if "work_end_minute" not in trip_cols:
+        conn.execute("ALTER TABLE confirmed_trips ADD COLUMN work_end_minute INTEGER")
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +299,18 @@ def _seed_demo(conn: sqlite3.Connection) -> None:
             "INSERT INTO toll_rates(version, seg_id, start_minute, end_minute,"
             " rate_cents_per_minute) VALUES (1, 1, ?, ?, ?)",
             [(0, 360, 2), (360, 720, 1), (720, 1440, 2)],
+        )
+
+        # 泊位演示数据：为内港码头 D 登记一个全天开放泊位 D1；调度员可通过
+        # POST /api/nodes/{node_id}/berths 为其他节点登记，并用
+        # PUT /api/berths/{berth_id}/calendar 整组替换开放日历。
+        conn.execute(
+            "INSERT INTO berths(berth_id, node_id, note)"
+            " VALUES ('D1', 'D', '内港码头 1 号泊位（全天开放）')"
+        )
+        conn.execute(
+            "INSERT INTO berth_open_intervals(berth_id, start_minute, end_minute)"
+            " VALUES ('D1', 0, 1440)"
         )
         conn.execute("COMMIT")
     except Exception:

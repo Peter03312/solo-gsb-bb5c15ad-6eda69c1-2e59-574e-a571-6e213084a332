@@ -22,6 +22,12 @@ from typing import Optional
 
 from .. import config
 from ..errors import ApiError, no_itinerary, tide_missing, unknown_node
+from .berths import (
+    berth_free_at,
+    load_berth_occupancy,
+    resolve_plan_berth,
+    work_fits_calendar,
+)
 from .controls import effective_travel_time, load_controls
 
 
@@ -187,12 +193,22 @@ def find_itinerary(
     margin: float,
     revision: Optional[int] = None,
     blocked: Optional[dict[int, set[int]]] = None,
+    berth_id: Optional[str] = None,
+    work_minutes: Optional[int] = None,
+    berth_blocked: Optional[dict[str, list[tuple[int, int]]]] = None,
 ) -> dict:
     """计算最早抵达行程。
 
-    blocked 给出须避开的已确认占用 {seg_id: {绝对分钟}}；缺省为不避占
+    blocked 给出须避开的已确认航段占用 {seg_id: {绝对分钟}}；缺省为不避占
     （仅供不需要占用语义的内部调用）。
+
+    泊位参数（berth_id 与 work_minutes 成对出现，二选一整体缺省）：船抵达
+    终点即开工，作业区间 [arrival, arrival+work) 须完整落在该泊位同一开放
+    区间、且不与 berth_blocked（{berth_id: [(起, 止), ...]}，半开占用）
+    重叠。未指定泊位时求解与响应完全沿用旧语义。berth_blocked 缺省时由
+    调用方语义决定：HTTP 单船/批次路径总是显式传入（含本批前船拟占用）。
     未知节点 -> NODE_NOT_FOUND (404)
+    未知泊位 -> BERTH_NOT_FOUND (404)；泊位不属终点 -> BERTH_NOT_AT_DESTINATION (422)
     窗口内缺潮位 -> MISSING_TIDE_DATA (422)
     无可行行程 -> NO_FEASIBLE_ITINERARY (404)
     """
@@ -229,18 +245,31 @@ def find_itinerary(
 
     horizon = start_minute + window_minutes
 
-    # 3) 潮位覆盖校验：占用分钟最晚到 horizon-1，窗口逐分钟均须有值
+    # 2b) 泊位参数解析（未知泊位 / 不属终点 / 非法作业分钟在此拒绝）
+    berth = resolve_plan_berth(conn, berth_id, work_minutes, destination)
+    berth_mode = berth is not None
+    if berth_mode:
+        berth_occupied = (berth_blocked or {}).get(berth["berth_id"], [])
+
+    # 3) 潮位覆盖校验：占用分钟最晚到 horizon-1；泊位模式作业区间同样须落在
+    #    窗口内（arrival+work <= horizon），故潮位仍按整个窗口逐分钟校验
     tide = _load_tide(conn, revision, start_minute, horizon - 1)
     missing = [m for m in range(start_minute, horizon) if m not in tide]
     if missing:
         raise tide_missing(missing)
 
-    # 4) 起终点相同：零航段，立即抵达
+    # 4) 起终点相同：零航段，立即抵达（泊位模式下须在起点=终点即时开工）
     if origin == destination:
-        return _result(
+        if berth_mode and not _berth_window_ok(
+            start_minute, berth, berth_occupied, horizon
+        ):
+            raise no_itinerary(origin, destination)
+        result = _result(
             revision, origin, destination, start_minute, window_minutes,
             draft, height, margin, arrival=start_minute, legs=[],
         )
+        _attach_berth(result, berth, start_minute)
+        return result
 
     segs = _load_segments(conn)
     seg_list = list(segs.values())
@@ -258,27 +287,41 @@ def find_itinerary(
     # 5) 按分钟展开的 DP
     # states[t-local] : 节点 -> 到达该节点该分钟的最优（字典序最小）航段编号序列
     # parents[...]     : 节点 -> (前一局部分钟, 进入所用航段 seg_id 或 None=等待)
+    #
+    # 泊位模式下终点是"吸收态"：船一旦抵达终点即开工，不能在终点等待或再出
+    # 发。故终点的到达只可能来自某条航段（fresh arrivals），不做等待传播、
+    # 也不从终点展开任何航段；每个局部分钟只保留该分钟新鲜抵达中字典序最小
+    # 的航段序列。非泊位模式保持原有等待传播与首次抵达即最优的提前终止。
     n = window_minutes
     states: list[dict[str, tuple]] = [dict() for _ in range(n + 1)]
     parents: list[dict[str, tuple]] = [dict() for _ in range(n + 1)]
+    fresh_dest: dict[int, tuple] = {}       # 泊位模式：局部分钟 -> 新鲜抵达序列
+    fresh_parents: dict[int, tuple] = {}    # 泊位模式：局部分钟 -> (前局部分钟, seg_id)
     states[0][origin] = ()
 
     arrival_local = None
     for i in range(n + 1):
-        # 5.1 等待：从 i-1 原样延续到 i（同序列，不加航段编号）
+        # 5.1 等待：从 i-1 原样延续到 i（同序列，不加航段编号）。
+        #     泊位模式终点不等待（抵达即开工），故等待传播跳过终点。
         if i > 0:
             for v, seq in states[i - 1].items():
+                if berth_mode and v == destination:
+                    continue
                 if v not in states[i] or seq < states[i][v]:
                     states[i][v] = seq
                     parents[i][v] = (i - 1, None)
 
-        # 5.2 终点首次出现即为最早到达；此刻其序列必为该到达时刻字典序最优
-        if destination in states[i]:
+        # 5.2 非泊位模式：终点首次出现即为最早到达，此刻其序列必为该到达
+        #     时刻字典序最优。泊位模式改为扫描全部新鲜抵达（见 5.4）。
+        if not berth_mode and destination in states[i]:
             arrival_local = i
             break
 
-        # 5.3 从本分钟出发的航段（船恰好在节点上即可出发，等待后亦可）
+        # 5.3 从本分钟出发的航段（船恰好在节点上即可出发，等待后亦可）。
+        #     泊位模式不从终点出发；落入终点的航段写入 fresh_dest。
         for v, seq in states[i].items():
+            if berth_mode and v == destination:
+                continue
             for s in out_segs.get(v, []):
                 t = travel_at[s.seg_id][i]
                 j = i + t
@@ -287,24 +330,53 @@ def find_itinerary(
                 if not feasible[s.seg_id][i]:
                     continue
                 cand = seq + (s.seg_id,)
+                if berth_mode and s.destination == destination:
+                    old = fresh_dest.get(j)
+                    if old is None or cand < old:
+                        fresh_dest[j] = cand
+                        fresh_parents[j] = (i, s.seg_id)
+                    continue
                 old = states[j].get(s.destination)
                 if old is None or cand < old:
                     states[j][s.destination] = cand
                     parents[j][s.destination] = (i, s.seg_id)
 
+        # 5.4 泊位模式：按分钟升序，首个泊位作业可行的新鲜抵达即全局最优
+        #     （最早抵达；同刻新鲜抵达已只保留字典序最小序列）。
+        if berth_mode and i in fresh_dest:
+            arrival_abs = start_minute + i
+            if _berth_window_ok(arrival_abs, berth, berth_occupied, horizon):
+                arrival_local = i
+                break
+
     if arrival_local is None:
         raise no_itinerary(origin, destination)
 
     # 6) 回溯每段起止分钟
-    legs: list[tuple[int, int, int]] = []  # (seg_id, 进入局部分钟, 到达局部分钟)
-    v, i = destination, arrival_local
-    while not (v == origin and i == 0):
-        prev_i, seg_id = parents[i][v]
-        if seg_id is not None:
-            legs.append((seg_id, prev_i, i))
-            v = segs[seg_id].origin
-        i = prev_i
-    legs.reverse()
+    if berth_mode:
+        # 泊位模式：终点这一步取自 fresh_parents，其后在非终点节点上按
+        # parents 回溯（终点从未进入 states/parents）。
+        legs: list[tuple[int, int, int]] = []
+        prev_i, seg_id = fresh_parents[arrival_local]
+        legs.append((seg_id, prev_i, arrival_local))
+        v, i = segs[seg_id].origin, prev_i
+        while not (v == origin and i == 0):
+            pi, pid = parents[i][v]
+            if pid is not None:
+                legs.append((pid, pi, i))
+                v = segs[pid].origin
+            i = pi
+        legs.reverse()
+    else:
+        legs = []
+        v, i = destination, arrival_local
+        while not (v == origin and i == 0):
+            prev_i, seg_id = parents[i][v]
+            if seg_id is not None:
+                legs.append((seg_id, prev_i, i))
+                v = segs[seg_id].origin
+            i = prev_i
+        legs.reverse()
 
     leg_dicts = [
         {
@@ -318,10 +390,41 @@ def find_itinerary(
         }
         for sid, pi, ai in legs
     ]
-    return _result(
+    result = _result(
         revision, origin, destination, start_minute, window_minutes,
         draft, height, margin, arrival=start_minute + arrival_local, legs=leg_dicts,
     )
+    # 无论是否指定泊位都附带泊位字段（未指定时为 None，旧响应仅新增 null 字段）
+    _attach_berth(result, berth if berth_mode else None,
+                  start_minute + arrival_local)
+    return result
+
+
+def _berth_window_ok(arrival: int, berth: dict,
+                     occupied: list[tuple[int, int]], horizon: int) -> bool:
+    """抵达分钟 arrival 时能否在该泊位完成作业：作业区间不越规划窗口
+    （arrival+work <= horizon）、完整落在同一开放区间且不与占用重叠。"""
+    if arrival + berth["work_minutes"] > horizon:
+        return False
+    return (
+        work_fits_calendar(arrival, berth["work_minutes"], berth["calendar"])
+        and berth_free_at(arrival, berth["work_minutes"], occupied)
+    )
+
+
+def _attach_berth(result: dict, berth: Optional[dict], arrival: int) -> None:
+    """把泊位作业结果附加到规划响应：抵达即开工，作业区间固化为
+    [arrival, arrival + work_minutes)。未指定泊位时字段为 None。"""
+    if berth is None:
+        result["berth_id"] = None
+        result["work_minutes"] = None
+        result["work_start_minute"] = None
+        result["work_end_minute"] = None
+        return
+    result["berth_id"] = berth["berth_id"]
+    result["work_minutes"] = berth["work_minutes"]
+    result["work_start_minute"] = arrival
+    result["work_end_minute"] = arrival + berth["work_minutes"]
 
 
 def _result(revision, origin, destination, start_minute, window_minutes,

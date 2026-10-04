@@ -34,6 +34,7 @@ from typing import Optional
 
 from .. import config
 from ..errors import ApiError, tide_missing, trip_not_found
+from .berths import berth_free_at, load_berth_occupancy, load_calendar, work_fits_calendar
 from .controls import effective_travel_time, load_controls
 from .planning import (
     Segment,
@@ -67,6 +68,19 @@ def review_and_reschedule(
     window = snap["window_minutes"]
     horizon = start + window
     draft, height, margin = snap["draft"], snap["height"], snap["margin"]
+
+    # 泊位快照：原快照指定泊位时，改期建议必须同时在**原泊位**找到可用的
+    # 即时作业区间（抵达即开工，按当前日历与当时占用，建议不预留）。
+    berth_id = snap["berth_id"]
+    work_minutes = snap["work_minutes"]
+    berth_calendar = None
+    berth_occupied = None
+    if berth_id is not None:
+        berth_calendar = load_calendar(conn, [berth_id]).get(berth_id, [])
+        # 改期建议避开其他有效快照的泊位作业占用，排除自身（自身不挡自己）
+        berth_occupied = load_berth_occupancy(
+            conn, start, horizon - 1, exclude_trip_id=snap["trip_id"]
+        ).get(berth_id, [])
 
     # 2) 目标修订号（显式指定或取最新），沿用规划接口的缺潮位/未知修订语义
     if revision is None:
@@ -117,6 +131,11 @@ def review_and_reschedule(
         "reschedule": None,
         "no_solution": False,
         "original_itinerary": legs,
+        # 泊位快照（未指定泊位的旧确认为 None）；潮位复核本身仍只按原快照
+        "berth_id": berth_id,
+        "work_minutes": work_minutes,
+        "work_start_minute": snap["work_start_minute"],
+        "work_end_minute": snap["work_end_minute"],
     }
 
     # 5) 安全（含零航段）：原行程本身即最优改期（0 段变动），无需改期
@@ -133,6 +152,8 @@ def review_and_reschedule(
     resched = _reschedule(
         legs, segs, tide, start, window, draft, height, margin, revision,
         blocked, controls,
+        berth_id=berth_id, work_minutes=work_minutes,
+        berth_calendar=berth_calendar, berth_occupied=berth_occupied,
     )
     if resched is None:
         result["no_solution"] = True
@@ -207,12 +228,18 @@ def _check_original(legs, segs, tide, draft, height, margin) -> Optional[dict]:
 def _reschedule(
     legs, segs, tide, start, window, draft, height, margin, revision,
     blocked=None, controls=None,
+    berth_id=None, work_minutes=None, berth_calendar=None, berth_occupied=None,
 ) -> Optional[dict]:
     """固定航段序列的时间展开 DP，返回最优改期或 None。
 
     blocked 为须避开的其他已确认快照占用 {seg_id: {绝对分钟}}（本快照
     自身已排除）；controls 为当前分时航时管制，各段航时以**出发分钟**
     当时管制计（未命中区间用航段基础航时）。
+
+    work_minutes 非 None（原快照指定泊位）时：每个候选抵达分钟 a 还须令
+    作业区间 [a, a+work) 完整落在**原泊位当前日历**的同一开放区间且不与
+    其他有效快照的泊位作业占用重叠（抵达即开工；建议不预留）。择优次序
+    （变化段数 → 抵达最早 → 出发序列字典序）不变。
     """
     k = len(legs)
     if k == 0:
@@ -260,12 +287,26 @@ def _reschedule(
             if old is None or key < old:
                 nxt[d + t] = key
 
-    if not states[k]:
+    # 泊位约束：候选抵达分钟必须能在原泊位即时开工（完整落在同一当前开放
+    # 区间且不与其他有效快照作业占用半开重叠，作业区间不越窗口）。
+    def _berth_ok(local_arr: int) -> bool:
+        if work_minutes is None:
+            return True
+        arrival = start + local_arr
+        if arrival + work_minutes > start + window:
+            return False
+        return (
+            work_fits_calendar(arrival, work_minutes, berth_calendar or [])
+            and berth_free_at(arrival, work_minutes, berth_occupied or [])
+        )
+
+    feasible_arrivals = {la: key for la, key in states[k].items() if _berth_ok(la)}
+    if not feasible_arrivals:
         return None
 
     # 全局择优：变化段数最少 -> 抵达最早 -> 出发分钟序列字典序最小
     arrival_local, key = min(
-        states[k].items(), key=lambda kv: (kv[1][0], kv[0], kv[1][1])
+        feasible_arrivals.items(), key=lambda kv: (kv[1][0], kv[0], kv[1][1])
     )
     changes, deps = key
     arrival = start + arrival_local
@@ -299,4 +340,9 @@ def _reschedule(
         "changed_leg_count": changes,
         "changed_legs": changed,
         "itinerary": itinerary,
+        # 原泊位的即时作业区间（抵达即开工）；未指定泊位时为 None
+        "berth_id": berth_id,
+        "work_minutes": work_minutes,
+        "work_start_minute": arrival if work_minutes is not None else None,
+        "work_end_minute": arrival + work_minutes if work_minutes is not None else None,
     }

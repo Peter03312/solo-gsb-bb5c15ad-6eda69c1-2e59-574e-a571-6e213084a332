@@ -18,6 +18,7 @@ import sqlite3
 from typing import Iterable, Optional
 
 from ..errors import ApiError
+from .berths import load_berth_occupancy
 from .groups import expand_group_occupancy, load_groups
 from .planning import find_itinerary, load_occupancy
 from .ships import resolve_for_confirm, resolve_for_plan
@@ -65,7 +66,21 @@ def _ship_kwargs(ship, params: dict) -> dict:
         "draft": params["draft"],
         "height": params["height"],
         "margin": params["margin"],
+        "berth_id": ship.berth_id,
+        "work_minutes": ship.work_minutes,
     }
+
+
+def _add_berth_occupancy(blocked: dict[str, list[tuple[int, int]]],
+                         result: dict) -> None:
+    """把一艘船预排/复算所得泊位作业区间并入后船的泊位拟占用
+    {berth_id: [(起, 止), ...]}（与已确认泊位占用同口径，半开、抵达即开工）。"""
+    if result.get("berth_id") is None:
+        return
+    blocked.setdefault(result["berth_id"], []).append(
+        (result["work_start_minute"], result["work_end_minute"])
+    )
+    blocked[result["berth_id"]].sort()
 
 
 def _add_itinerary_occupancy(blocked: dict[int, set[int]], legs: Iterable[dict],
@@ -139,6 +154,7 @@ def plan_batch(conn, ships: list, revision: Optional[int]) -> dict:
     lo = min(s.start_minute for s in ships)
     hi = max(s.start_minute + s.window_minutes - 1 for s in ships)
     blocked = load_occupancy(conn, lo, hi)
+    berth_blocked = load_berth_occupancy(conn, lo, hi)
     groups = load_groups(conn)
 
     results = []
@@ -147,10 +163,12 @@ def plan_batch(conn, ships: list, revision: Optional[int]) -> dict:
             params = _resolve_plan_params(conn, ship)
             result = find_itinerary(
                 conn, **_ship_kwargs(ship, params), revision=rev, blocked=blocked,
+                berth_blocked=berth_blocked,
             )
         except ApiError as exc:
             raise _tag_ship_error(i, exc)
         _add_itinerary_occupancy(blocked, result["itinerary"], groups)
+        _add_berth_occupancy(berth_blocked, result)
         # 按档案预排的船回传船号、版本及所用参数（直接提交参数则为 null）
         result["ship_no"] = params["ship_no"]
         result["ship_version"] = params["ship_version"]
@@ -268,10 +286,11 @@ def confirm_batch(conn, body) -> tuple[dict, bool]:
         if latest is None or latest["revision"] != body.revision:
             raise _stale_error(body.revision, latest["revision"] if latest else None)
 
-        # 3) 当时已确认占用（覆盖全批窗口的并集区间）
+        # 3) 当时已确认占用（覆盖全批窗口的并集区间；航段与泊位分别加载）
         lo = min(s.start_minute for s in body.ships)
         hi = max(s.start_minute + s.window_minutes - 1 for s in body.ships)
         blocked = load_occupancy(conn, lo, hi)
+        berth_blocked = load_berth_occupancy(conn, lo, hi)
         groups = load_groups(conn)
 
         trip_refs: list[dict] = []
@@ -281,13 +300,15 @@ def confirm_batch(conn, body) -> tuple[dict, bool]:
                 recalculated = find_itinerary(
                     conn, **_ship_kwargs(ship, params),
                     revision=body.revision, blocked=blocked,
+                    berth_blocked=berth_blocked,
                 )
             except ApiError as exc:
                 if exc.code == "NO_FEASIBLE_ITINERARY":
                     raise _plan_mismatch(
                         i, reason="no_feasible_itinerary",
-                        message="占用或潮位已变化：该船窗口内已不存在可行行程，"
-                                "整批确认失败，全批不保存",
+                        message="占用或潮位已变化：该船窗口内已不存在可行行程"
+                                "（含终点泊位开放/作业占用变化），整批确认失败，"
+                                "全批不保存",
                     )
                 raise _tag_ship_error(i, exc)
 
@@ -298,24 +319,40 @@ def confirm_batch(conn, body) -> tuple[dict, bool]:
                 raise _plan_mismatch(
                     i, reason="itinerary_mismatch",
                     message="该船行程复核结果与所提交行程不一致（窗口/船舶参数/"
-                            "潮位/占用可能已变化），整批确认失败，全批不保存",
+                            "潮位/航段占用/泊位开放日历或作业占用可能已变化），"
+                            "整批确认失败，全批不保存",
+                    recalculated=recalculated,
+                )
+            # 泊位作业区间亦须与复算结果一致（抵达已在上方比对；此处再比对
+            # 泊位与作业分钟——作业区间完全由抵达+作业分钟决定）
+            if ship.berth_id != recalculated["berth_id"] or \
+                    ship.work_minutes != recalculated["work_minutes"]:
+                raise _plan_mismatch(
+                    i, reason="berth_mismatch",
+                    message="该船泊位/作业分钟复核结果与提交不一致，整批确认失败，"
+                            "全批不保存",
                     recalculated=recalculated,
                 )
 
             # 4a) 先保存该船不可变快照（同一事务，失败整体回滚）；
-            #     快照固化所用参数与档案引用（船号 + 版本，无档案则为 NULL）
+            #     快照固化所用参数与档案引用（船号 + 版本，无档案则为 NULL），
+            #     指定泊位时同时固化泊位编号与作业区间（抵达即开工）
             cur = conn.execute(
                 "INSERT INTO confirmed_trips"
                 " (revision, origin, destination, start_minute, window_minutes,"
                 "  draft, height, margin, arrival_minute, itinerary,"
-                "  ship_no, ship_version)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "  ship_no, ship_version, berth_id, work_minutes,"
+                "  work_start_minute, work_end_minute)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (body.revision, ship.origin, ship.destination, ship.start_minute,
                  ship.window_minutes, params["draft"], params["height"],
                  params["margin"],
                  recalculated["arrival_minute"],
                  json.dumps(recalculated["itinerary"]),
-                 params["ship_no"], params["ship_version"]),
+                 params["ship_no"], params["ship_version"],
+                 recalculated["berth_id"], recalculated["work_minutes"],
+                 recalculated["work_start_minute"],
+                 recalculated["work_end_minute"]),
             )
             trip_refs.append({
                 "index": i,
@@ -323,11 +360,17 @@ def confirm_batch(conn, body) -> tuple[dict, bool]:
                 "revision": body.revision,
                 "ship_no": params["ship_no"],
                 "ship_version": params["ship_version"],
+                "berth_id": recalculated["berth_id"],
+                "work_minutes": recalculated["work_minutes"],
+                "work_start_minute": recalculated["work_start_minute"],
+                "work_end_minute": recalculated["work_end_minute"],
                 "arrival_minute": recalculated["arrival_minute"],
                 "itinerary": recalculated["itinerary"],
             })
-            # 前船复算行程作为后船的当时占用（按当前组关系展开到整组）
+            # 前船复算行程作为后船的当时占用（按当前组关系展开到整组；
+            # 泊位作业区间并入泊位拟占用）
             _add_itinerary_occupancy(blocked, recalculated["itinerary"], groups)
+            _add_berth_occupancy(berth_blocked, recalculated)
 
         result = {
             "idempotency_key": key,

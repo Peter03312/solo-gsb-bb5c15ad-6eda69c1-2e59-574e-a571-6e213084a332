@@ -444,6 +444,54 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
     `GET /api/trips*` 新增可空字段 `ship_no/ship_version`；潮位复核与
     改期建议**只用快照参数**、不读档案，后续档案变更（含停用）不改写
     历史快照；作废与批次同键重放沿用旧语义（重放优先、不复核档案）。
+- **终点泊位与开放日历（本轮新增）**：调度员可为**现有节点**登记泊位
+  （全局唯一泊位编号），并以一组互不重叠的**半开分钟区间
+  `[start_minute, end_minute)`** **整组替换**该泊位的开放日历。
+  - **登记与日历**：`POST /api/nodes/{node_id}/berths`（泊位建成时日历为空、
+    全程不开放；未知节点 `404 NODE_NOT_FOUND`、泊位编号重复
+    `409 BERTH_EXISTS`）；`PUT /api/berths/{berth_id}/calendar` 整组替换
+    （空组 `[]` 表示全程不开放），起点非负、终点大于起点，否则
+    `422 INVALID_BERTH_INTERVAL`；组内半开交叠
+    `422 OVERLAPPING_BERTH_INTERVAL`（首尾相接合法）；未知泊位
+    `404 BERTH_NOT_FOUND`；**任一校验失败旧日历原样保留**。查询：
+    `GET /api/berths`（可 `?node=X` 过滤）、`GET /api/berths/{berth_id}`。
+  - **指定泊位预排**：单船 `/api/trips/plan` 与批次
+    `/api/trips/batch/plan` 可携带**成对出现**的 `berth_id`（终点泊位）与
+    `work_minutes`（**正整数**作业分钟）。船**抵达即开工**，作业区间
+    `[arrival, arrival+work_minutes)` 必须：
+    ① **完整落在同一开放区间**内（不得跨两个开放区间拼接）；
+    ② 不与**有效确认行程**（未作废）在该泊位的固化作业区间半开重叠
+    （`[a,a+w)` 与 `[b,b+v)` 在 `a<b+v 且 b<a+w` 时冲突，首尾相接合法）；
+    ③ 作业区间不越规划窗口。响应回传 `berth_id`、`work_minutes` 及
+    `work_start_minute`（= 抵达分钟）/ `work_end_minute`；窗口内无满足
+    条件的抵达仍返回 `404 NO_FEASIBLE_ITINERARY`。
+  - **等待语义**：船**不能在终点等待**（抵达即开工），但仍可在起点与
+    途经节点等待——泊位约束随"最早抵达、同刻航段编号序列字典序"的既有
+    择优一起求解，即选择最早的、能在泊位完成作业的抵达。
+  - **校验口径**：未知泊位 `404 BERTH_NOT_FOUND`；泊位不属终点
+    `422 BERTH_NOT_AT_DESTINATION`（批次附 `details.ship_index`）；作业
+    分钟非正整数或与泊位编号不成对 `422 VALIDATION_ERROR`。
+  - **未指定泊位完全不变**：不带泊位字段的旧请求与旧响应结构完全兼容
+    （响应仅新增 4 个值为 `null` 的可空泊位字段），规划、确认、批次、
+    账单逻辑均不读取泊位。
+  - **确认事务内复算**：`/api/trips/confirm` 与
+    `/api/trips/batch/confirm` 在原事务内按**当时开放日历与泊位占用**
+    （批次另含前船**拟作业占用**，后船避前船）连同既有潮位/管制/航段
+    占用一并复算；日历或泊位占用变化导致无可行抵达，或行程/泊位作业
+    区间与提交不一致，仍为 `409 PLAN_MISMATCH`（批次附 `ship_index`、
+    **全批回滚**）；同键同内容重放仍返回首次结果（即使日历已变化）。
+  - **快照固化、日历变更不改历史**：确认成功时泊位编号、作业分钟与作业
+    区间（`work_start_minute/work_end_minute`）写入不可变快照；之后
+    开放日历如何替换都不改写历史，泊位占用始终按**固化区间**计算。
+    作废行程即释放其泊位作业占用（与航段占用同一口径），历史快照
+    （含泊位字段）仍可查。
+  - **复核与改期建议**：`POST /api/trips/{id}/review` 的原航路潮位复核
+    **仍只按原快照**判断安全，与泊位日历/占用无关；响应回传快照泊位
+    字段。原行程不安全需要改期时，若快照指定了泊位，改期建议必须
+    **同时**在**原泊位**按**当前开放日历**与当时其他有效快照的泊位占用
+    找到一个可用的**即时作业区间**（抵达即开工、建议不预留）；找不到则
+    `no_solution=true`（即使航段时间上可改期）。建议响应
+    `reschedule` 内附 `berth_id/work_start_minute/work_end_minute`。
 
 ### 错误响应格式
 
@@ -489,12 +537,53 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 对已作废且未开单的行程开单 | 409 | `TRIP_ALREADY_VOIDED`（不出账单、不出冲销） |
 | 查询账单时行程尚未开单 | 404 | `BILL_NOT_FOUND` |
 | 查询冲销单时已开单但行程未作废（无冲销） | 404 | `REVERSAL_NOT_FOUND` |
+| 登记泊位时节点未知 | 404 | `NODE_NOT_FOUND` |
+| 泊位未知（查询/日历替换/预排） | 404 | `BERTH_NOT_FOUND` |
+| 泊位编号重复登记 | 409 | `BERTH_EXISTS`（不留半成品） |
+| 指定泊位不属于预排终点（批次附 `ship_index`） | 422 | `BERTH_NOT_AT_DESTINATION` |
+| 泊位开放区间非法（`start<0` / `end<=start`），替换失败不改旧日历 | 422 | `INVALID_BERTH_INTERVAL` |
+| 泊位开放区间组内半开交叠，替换失败不改旧日历 | 422 | `OVERLAPPING_BERTH_INTERVAL` |
+| 作业分钟非正整数、泊位与作业分钟不成对 | 422 | `VALIDATION_ERROR` |
 
 ---
 
 ## 3. HTTP API
 
-> **本轮用法（通行费费率版本、账单与冲销单）**：新增 6 个端点；旧 API
+> **本轮用法（终点泊位与开放日历）**：新增 4 个泊位端点，并为单船/批次
+> 预排与确认扩展可选泊位字段；不带泊位字段的旧请求与响应**完全兼容**
+> （仅新增值为 `null` 的可空字段）——
+> - `POST /api/nodes/{node_id}/berths`：为现有节点登记泊位（全局唯一泊位
+>   编号 + 可选备注），初始开放日历为空；未知节点 `404 NODE_NOT_FOUND`、
+>   重复编号 `409 BERTH_EXISTS`；
+> - `PUT /api/berths/{berth_id}/calendar`：以互不重叠的半开分钟区间
+>   `[start_minute, end_minute)` 整组替换开放日历（空组 `[]` 全程不开放），
+>   返回泊位视图；起点非负、终点大于起点否则
+>   `422 INVALID_BERTH_INTERVAL`，组内交叠
+>   `422 OVERLAPPING_BERTH_INTERVAL`，未知泊位 `404 BERTH_NOT_FOUND`，
+>   **失败不改旧日历**；日历变更只影响之后的预排/确认复算，**不改已确认
+>   快照**；
+> - `GET /api/berths`（可 `?node=X` 过滤，未知节点 `404`）/
+>   `GET /api/berths/{berth_id}`（未知泊位 `404 BERTH_NOT_FOUND`）；
+> - `POST /api/trips/plan` / `POST /api/trips/batch/plan`：可携带成对的
+>   `berth_id` 与正整数 `work_minutes`；船抵达终点即开工，作业区间
+>   `[arrival, arrival+work)` 须完整落在泊位**同一开放区间**、不与有效
+>   确认行程的泊位作业占用半开重叠（批次后船另避前船拟作业占用）且不越
+>   窗口；响应回传 `berth_id/work_minutes/work_start_minute/
+>   work_end_minute`；无解仍为 `404 NO_FEASIBLE_ITINERARY`（批次附
+>   `ship_index`）；未知泊位 `404 BERTH_NOT_FOUND`、泊位不属终点
+>   `422 BERTH_NOT_AT_DESTINATION`、作业分钟非法/不成对
+>   `422 VALIDATION_ERROR`；
+> - `POST /api/trips/confirm` / `POST /api/trips/batch/confirm`：原事务内
+>   按**当时日历与泊位占用**复算，变化致行程或作业区间不一致
+>   `409 PLAN_MISMATCH`（批次全批回滚、同键同内容重放原结果）；成功时
+>   快照**固化**泊位与作业区间，后续日历变更不改历史，`GET /api/trips*`
+>   回传泊位字段；
+> - 作废行程即释放其泊位作业占用（历史快照仍可查）；
+>   `POST /api/trips/{id}/review` 的潮位复核仍按原快照；涉及泊位的改期
+>   建议须同时找到原泊位可用的即时作业区间（只建议不预留），找不到则
+>   `no_solution=true`。
+>
+> **上一轮用法（通行费费率版本、账单与冲销单）**：新增 6 个端点；旧 API
 > 路径与请求/响应完全兼容（作废接口的请求、响应与状态码保持不变，仅在
 > 作废已开单行程时于同事务额外落库冲销单）——
 > - `PUT /api/segments/{seg_id}/toll-rates`：财务按航段提交整组半开分钟
@@ -610,6 +699,10 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 | --- | --- | --- |
 | POST | `/api/nodes` | 录入节点 |
 | GET | `/api/nodes` | 节点列表 |
+| POST | `/api/nodes/{node_id}/berths` | **本轮新增**：为现有节点登记泊位（全局唯一编号，初始日历为空）；未知节点 `NODE_NOT_FOUND`、重复 `BERTH_EXISTS` |
+| GET | `/api/berths` | **本轮新增**：泊位列表（可 `?node=X` 过滤；各附当前开放日历） |
+| GET | `/api/berths/{berth_id}` | **本轮新增**：泊位详情（未知泊位 `BERTH_NOT_FOUND`） |
+| PUT | `/api/berths/{berth_id}/calendar` | **本轮新增**：以半开分钟区间整组替换泊位开放日历（空组全程不开放）；非法/交叠区间 422 且旧日历不变；未知泊位 `BERTH_NOT_FOUND` |
 | POST | `/api/segments` | 录入单向航段 |
 | GET | `/api/segments` | 航段列表（按编号排序） |
 | PUT | `/api/segments/{seg_id}/travel-controls` | 以航段编号整组替换分时航时管制（半开区间 + 通行分钟，空组恢复基础航时），返回生效清单 |
@@ -630,11 +723,11 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/tide/revisions/{rev}?from_minute=&to_minute=` | 取某修订逐分钟名义潮位 `levels` 与预测误差 `errors` |
 | POST | `/api/tide/corrections` | 名义潮位更正（继承误差），生成新修订 |
 | POST | `/api/tide/error-revisions` | 预测误差修订（名义潮位不变），生成新修订 |
-| POST | `/api/trips/plan` | 规划最早抵达行程 |
-| POST | `/api/trips/confirm` | 携带修订号确认行程（事务复核） |
-| POST | `/api/trips/batch/plan` | **本轮新增**：同修订 2～5 艘船按优先顺序批次预排（只读不占位，后船避前船拟占用） |
-| POST | `/api/trips/batch/confirm` | **本轮新增**：携带修订号 + 幂等键批次确认（事务逐艘复算，全成全败、幂等重放） |
-| POST | `/api/trips/{trip_id}/review` | 更正后按目标修订复核原行程，不安全时求改期 |
+| POST | `/api/trips/plan` | 规划最早抵达行程；**本轮扩展**：可携 `berth_id`+`work_minutes` 指定终点泊位（抵达即开工，作业区间完整落在同一开放区间且不与有效泊位占用重叠） |
+| POST | `/api/trips/confirm` | 携带修订号确认行程（事务复核）；指定泊位时按当时日历/占用复算并固化泊位作业区间 |
+| POST | `/api/trips/batch/plan` | **本轮扩展泊位**：同修订 2～5 艘船按优先顺序批次预排（只读不占位，后船避前船航段与泊位拟占用） |
+| POST | `/api/trips/batch/confirm` | 携带修订号 + 幂等键批次确认（事务逐艘复算，全成全败、幂等重放；泊位作业区间一并复算固化） |
+| POST | `/api/trips/{trip_id}/review` | 更正后按目标修订复核原行程，不安全时求改期；**本轮扩展**：快照指定泊位时改期建议须同时给出原泊位可用即时作业区间（只建议不预留），否则 `no_solution` |
 | POST | `/api/trips/{trip_id}/void` | 凭非空原因作废误确认行程（重复作废 200 返回首次记录）；作废已开单行程时同事务生成等额冲销单（接口请求/响应/状态码不变） |
 | GET | `/api/trips/{trip_id}/void` | 按行程号查询作废记录（未作废 `VOID_RECORD_NOT_FOUND`） |
 | POST | `/api/trips/{trip_id}/bill` | **本轮新增**：为已确认行程开具通行费账单（按当时最新版本 + 快照进入分钟固化；重试 200 返回原账单；已作废未开单 `TRIP_ALREADY_VOIDED`） |
@@ -1028,6 +1121,79 @@ POST /api/trips/confirm
 各自选择船号或三项参数；确认时任一船档案失效（附 `details.ship_index`）
 **全批回滚**，同键重放仍返回首次结果。
 
+### 泊位登记 / 开放日历 / 泊位预排请求与响应示例（本轮新增）
+
+**1）为现有节点登记泊位**（初始日历为空，全程不开放）：
+
+```json
+POST /api/nodes/D/berths
+{ "berth_id": "D2", "note": "内港 2 号泊位" }
+```
+
+```json
+201
+{ "berth_id": "D2", "node_id": "D", "note": "内港 2 号泊位",
+  "created_at": "2026-10-04 01:00:00", "calendar": [] }
+```
+
+**2）整组替换开放日历**（互不交叠的半开分钟区间；空组 `[]` 全程不开放）：
+
+```json
+PUT /api/berths/D2/calendar
+{ "intervals": [
+    {"start_minute": 0,    "end_minute": 360},
+    {"start_minute": 360,  "end_minute": 1440}
+] }
+```
+
+返回替换后的泊位视图（`calendar` 按起点升序）。非法区间
+`422 INVALID_BERTH_INTERVAL`、组内交叠
+`422 OVERLAPPING_BERTH_INTERVAL` 时旧日历不变；未知泊位
+`404 BERTH_NOT_FOUND`。
+
+**3）指定终点泊位 + 作业分钟预排**（`berth_id` 与 `work_minutes` 成对；
+船抵达即开工）：
+
+```json
+POST /api/trips/plan
+{
+  "origin": "A", "destination": "D",
+  "start_minute": 0, "window_minutes": 1440,
+  "draft": 3.0, "height": 0.0, "margin": 0.0,
+  "berth_id": "D2", "work_minutes": 30
+}
+```
+
+响应在常规行程基础上回传泊位与作业起止分钟（下例 90 抵达，作业
+`[90,120)` 完整落在 `[0,360)` 开放区间）：
+
+```json
+{
+  "revision": 1, "origin": "A", "destination": "D",
+  "start_minute": 0, "window_minutes": 1440,
+  "draft": 3.0, "height": 0.0, "margin": 0.0,
+  "ship_no": null, "ship_version": null,
+  "berth_id": "D2", "work_minutes": 30,
+  "work_start_minute": 90, "work_end_minute": 120,
+  "arrival_minute": 90, "total_wait_minutes": 0,
+  "itinerary": [
+    {"seg_id": 1, "origin": "A", "destination": "B", "start_minute": 0,  "end_minute": 30, "travel_time": 30},
+    {"seg_id": 2, "origin": "B", "destination": "C", "start_minute": 30, "end_minute": 70, "travel_time": 40},
+    {"seg_id": 3, "origin": "C", "destination": "D", "start_minute": 70, "end_minute": 90, "travel_time": 20}
+  ]
+}
+```
+
+若开放日历 / 既有泊位作业占用使窗口内任何抵达都无法完整容纳作业区间，
+返回 `404 NO_FEASIBLE_ITINERARY`；泊位不属终点
+`422 BERTH_NOT_AT_DESTINATION`、未知泊位 `404 BERTH_NOT_FOUND`、作业
+分钟非正整数或与泊位不成对 `422 VALIDATION_ERROR`。确认时把该响应
+**原样回填**即可（快照固化 `work_start_minute/work_end_minute`）；
+`GET /api/trips*` 的泊位字段与本响应一致，作废后增加 `voided_at`。
+
+批次中各船可独立携带 `berth_id/work_minutes`；后船自动避开前船的拟作业
+区间，任一船冲突按 `details.ship_index` 返回，详见下节。
+
 ### 规划请求 / 响应示例
 
 请求：
@@ -1241,6 +1407,13 @@ POST /api/trips/1/review
   即按对应保守极值计算的实际可用值。
 - **窗口内无改期解**：`reschedule=null` 且 `no_solution=true`，`first_violation`
   仍给出原行程风险；快照保持不变（`GET /api/trips/{trip_id}` 读到的仍是原内容）。
+- **涉及泊位的快照**：顶层回传快照的 `berth_id/work_minutes/
+  work_start_minute/work_end_minute`；原航路潮位安全判断仍完全按原快照
+  （与开放日历变化无关）。需要改期时，`reschedule` 必须同时给出**原泊位**
+  按当前日历与其他有效快照占用求得的即时作业区间
+  （`berth_id="D2"`、`work_start_minute=新抵达`、
+  `work_end_minute=新抵达+work_minutes`，只建议不预留）；航段能改期但
+  原泊位窗口内无处作业时同样 `no_solution=true`。
 - 该接口为**只读**：不新增、不修改任何确认行程，也不产生新修订。
 
 ---
@@ -1256,7 +1429,52 @@ curl -s $BASE/health
 # 查看演示航段
 curl -s $BASE/api/segments
 
-# 0a) 本轮新增：通行费费率版本（财务按航段整组提交；继承其他航段、全局不可变）
+# 0) 本轮新增：终点泊位与开放日历（演示库启动即为内港节点 D 带全天开放泊位 D1）
+# 0.1) 为现有节点登记泊位（初始日历为空）；未知节点 404 NODE_NOT_FOUND，
+#      重复编号 409 BERTH_EXISTS
+curl -s -X POST $BASE/api/nodes/D/berths \
+  -H 'Content-Type: application/json' -d '{"berth_id":"D2","note":"内港 2 号泊位"}'
+# 0.2) 整组替换开放日历（半开区间、互不交叠；空组 [] 全程不开放）
+curl -s -X PUT $BASE/api/berths/D2/calendar \
+  -H 'Content-Type: application/json' \
+  -d '{"intervals":[{"start_minute":0,"end_minute":720},
+                    {"start_minute":720,"end_minute":1440}]}'
+# 非法 / 交叠区间分别 422 INVALID_BERTH_INTERVAL /
+# 422 OVERLAPPING_BERTH_INTERVAL，旧日历不变；未知泊位 404 BERTH_NOT_FOUND
+curl -s -i -X PUT $BASE/api/berths/D2/calendar -H 'Content-Type: application/json' \
+  -d '{"intervals":[{"start_minute":0,"end_minute":720},
+                    {"start_minute":700,"end_minute":900}]}' | head -1
+# 查询（?node=D 可按节点过滤）
+curl -s $BASE/api/berths
+curl -s $BASE/api/berths/D2
+
+# 0.3) 指定终点泊位 + 正整数作业分钟预排（抵达即开工；作业区间完整落在同一
+#      开放区间且不与有效确认的泊位作业占用重叠；无解 404 NO_FEASIBLE_ITINERARY）
+curl -s -X POST $BASE/api/trips/plan -H 'Content-Type: application/json' -d '{
+  "origin":"A","destination":"D","start_minute":0,"window_minutes":1440,
+  "draft":3.0,"height":0.0,"margin":0.0,
+  "berth_id":"D1","work_minutes":30}'
+# -> {"arrival_minute":90,"berth_id":"D1","work_minutes":30,
+#     "work_start_minute":90,"work_end_minute":120,"itinerary":[...]}
+# 泊位不属终点 422 BERTH_NOT_AT_DESTINATION；未知泊位 404 BERTH_NOT_FOUND；
+# work_minutes<=0 或只给一个字段 422 VALIDATION_ERROR
+# 0.4) 确认：把预排响应原样回填即可；事务内按当时日历与泊位占用复算，
+#      日历/占用变化致不一致 409 PLAN_MISMATCH 不保存；成功后快照固化作业区间
+PLAN=$(curl -s -X POST $BASE/api/trips/plan -H 'Content-Type: application/json' -d '{
+  "origin":"A","destination":"D","start_minute":0,"window_minutes":1440,
+  "draft":3.0,"height":0.0,"margin":0.0,"revision":1,
+  "berth_id":"D1","work_minutes":30}')
+echo "$PLAN" | curl -s -X POST $BASE/api/trips/confirm \
+  -H 'Content-Type: application/json' -d @-
+# 之后再收紧日历不影响已固化快照；仅影响之后的预排/确认复算
+curl -s -X PUT $BASE/api/berths/D1/calendar -H 'Content-Type: application/json' \
+  -d '{"intervals":[{"start_minute":0,"end_minute":100}]}' >/dev/null
+curl -s $BASE/api/trips/1   # work_start_minute/work_end_minute 仍为固化值
+# 作废即释放泊位作业占用（历史快照仍可查）
+curl -s -X POST $BASE/api/trips/1/void -H 'Content-Type: application/json' \
+  -d '{"reason":"误确认：泊位作业冲突"}'
+
+# 0a) 上一轮新增：通行费费率版本（财务按航段整组提交；继承其他航段、全局不可变）
 #     为航段 2 提交费率：[0,360) 5 分/分钟、[360,1080) 8 分/分钟
 curl -s -X PUT $BASE/api/segments/2/toll-rates \
   -H 'Content-Type: application/json' \
@@ -1710,6 +1928,46 @@ snap = requests.get(f"{B}/api/trips/{trip['trip_id']}").json()
 assert snap["draft"] == 6.5 and snap["ship_version"] == 1   # 确认时快照原样
 ```
 
+Python 示例（本轮新增：泊位登记/日历 → 泊位预排/确认 → 占用与日历复算）：
+
+```python
+import requests
+
+B = "http://localhost:8000"
+
+# 1) 为现有节点 D 登记泊位，并整组设置开放日历（半开区间、互不交叠）
+r = requests.post(f"{B}/api/nodes/D/berths", json={"berth_id": "D2", "note": "2 号泊位"})
+assert r.status_code == 201 and r.json()["calendar"] == []
+requests.put(f"{B}/api/berths/D2/calendar", json={"intervals": [
+    {"start_minute": 0, "end_minute": 720},
+    {"start_minute": 720, "end_minute": 1440},
+]}).raise_for_status()
+
+# 2) 指定终点泊位 + 正整数作业分钟预排（抵达即开工）
+plan = requests.post(f"{B}/api/trips/plan", json={
+    "origin": "A", "destination": "D", "start_minute": 0, "window_minutes": 1440,
+    "draft": 3.0, "height": 0.0, "margin": 0.0,
+    "berth_id": "D2", "work_minutes": 30,
+}).json()
+assert plan["arrival_minute"] == plan["work_start_minute"] == 90
+assert plan["work_end_minute"] == 120
+
+# 3) 原样回填确认；快照固化泊位与作业区间
+trip = requests.post(f"{B}/api/trips/confirm", json=plan).json()
+assert (trip["berth_id"], trip["work_start_minute"], trip["work_end_minute"]) == ("D2", 90, 120)
+
+# 4) 日历变更不影响历史快照；第二艘船预排自动避开 [90,120) 的泊位作业占用
+requests.put(f"{B}/api/berths/D2/calendar",
+             json={"intervals": [{"start_minute": 0, "end_minute": 1440}]}).raise_for_status()
+assert requests.get(f"{B}/api/trips/{trip['trip_id']}").json()["work_end_minute"] == 120
+
+# 5) 用日历收紧后的旧规划结果再确认 -> PLAN_MISMATCH（不保存）
+requests.put(f"{B}/api/berths/D2/calendar",
+             json={"intervals": [{"start_minute": 0, "end_minute": 100}]}).raise_for_status()
+stale = requests.post(f"{B}/api/trips/confirm", json=plan)
+assert stale.status_code == 409 and stale.json()["error"]["code"] == "PLAN_MISMATCH"
+```
+
 录入自定义数据：
 
 ```bash
@@ -1742,6 +2000,34 @@ curl -s -X POST $BASE/api/segments -H 'Content-Type: application/json' \
 
 剪枝依据：若序列 `s1 < s2`（字典序），则对任意后缀 `x` 恒有 `s1+x < s2+x`，
 故同一 `(节点, 分钟)` 只需保留最小序列，不会丢失最优解。复杂度 O(W·E)（W≤1440）。
+
+### 终点泊位与开放日历（实现见 `app/services/berths.py`、`planning.py`）
+
+1. 建表两张：`berths`（泊位编号主键、所属节点 `node_id` 外键、建成即固定；
+   登记时未知节点 `NODE_NOT_FOUND`、编号重复 `BERTH_EXISTS`）与
+   `berth_open_intervals`（`berth_id, start_minute` 主键的半开区间）。日历
+   整组替换在单事务内"先全删后插"，服务层先校验区间合法性
+   （`INVALID_BERTH_INTERVAL`）与组内半开交叠
+   （`OVERLAPPING_BERTH_INTERVAL`），任一失败回滚、旧日历原样保留。
+2. 泊位作业可行性是抵达分钟上的额外门槛（`planning._berth_window_ok`）：
+   作业区间 `[a, a+w)` 不越窗口、完整落在**同一**开放区间
+   （`berths.work_fits_calendar`，跨区间拼接不合法）、且不与
+   `load_berth_occupancy` 读出的有效确认作业区间半开重叠
+   （已作废快照经 `voided_trips` 过滤即时释放；批次另把前船复算作业区间
+   并入内存占用）。
+3. **DP 调整**：船抵达终点即开工、不能在终点等待——泊位模式下终点是
+   "吸收态"：等待传播与航段展开均跳过终点，落入终点的航段记录为"新鲜
+   抵达"（同刻只保留字典序最小航段序列）；按分钟升序第一个作业可行的
+   新鲜抵达即最优（最早抵达 + 同刻序列择优）。未指定泊位时 DP 与旧版逐
+   行一致，响应仅补 4 个 `null` 泊位字段。
+4. 确认（单船/批次）在原事务内以当时日历与泊位占用复算，除行程逐段一致
+   外还比对泊位与作业分钟（不一致 `PLAN_MISMATCH`，批次全批回滚）；通过
+   后把 `berth_id/work_minutes/work_start_minute/work_end_minute` 写入
+   `confirmed_trips` 不可变快照——之后日历替换不改历史，占用始终按固化
+   区间计算；旧库经 `_migrate` 自动补四列（既有行程为 `NULL`）。
+5. 改期 DP（`reschedule._reschedule`）在候选抵达集合上按同一门槛过滤
+   （原泊位当前日历 + 其他有效快照泊位占用，排除自身），无候选抵达即
+   `no_solution`；原航路潮位复核 `_check_original` 不读泊位。
 
 ### 狭窄水道组（实现见 `app/services/groups.py`）
 
